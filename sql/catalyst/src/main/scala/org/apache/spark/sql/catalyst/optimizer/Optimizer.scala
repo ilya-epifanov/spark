@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
+import scala.collection.{breakOut, mutable}
 import scala.collection.immutable.HashSet
 import org.apache.spark.sql.catalyst.analysis.{CleanupAliases, EliminateSubQueries}
 import org.apache.spark.sql.catalyst.expressions._
@@ -41,6 +42,8 @@ object DefaultOptimizer extends Optimizer {
       ReplaceDistinctWithAggregate,
       RemoveLiteralFromGroupExpressions) ::
     Batch("Operator Optimizations", FixedPoint(100),
+      // Filter expansion
+      TransitiveFilterExpansionViaEquality,
       // Operator push down
       SetOperationPushDown,
       SamplePushDown,
@@ -732,7 +735,8 @@ object PushPredicateThroughJoin extends Rule[LogicalPlan] with PredicateHelper {
   /**
    * Splits join condition expressions into three categories based on the attributes required
    * to evaluate them.
-   * @return (canEvaluateInLeft, canEvaluateInRight, haveToEvaluateInBoth)
+    *
+    * @return (canEvaluateInLeft, canEvaluateInRight, haveToEvaluateInBoth)
    */
   private def split(condition: Seq[Expression], left: LogicalPlan, right: LogicalPlan) = {
     val (leftEvaluateCondition, rest) =
@@ -815,6 +819,68 @@ object PushPredicateThroughJoin extends Rule[LogicalPlan] with PredicateHelper {
           Join(newLeft, newRight, LeftOuter, newJoinCond)
         case FullOuter => f
       }
+  }
+}
+
+/**
+ * Pushes down [[Filter]] operators where the `condition` can be
+ * evaluated using only the attributes of the left or right side of a join.  Other
+ * [[Filter]] conditions are moved into the `condition` of the [[Join]].
+ *
+ * And also pushes down the join filter, where the `condition` can be evaluated using only the
+ * attributes of the left or right side of sub query when applicable.
+ *
+ * Check https://cwiki.apache.org/confluence/display/Hive/OuterJoinBehavior for more details
+ */
+object TransitiveFilterExpansionViaEquality extends Rule[LogicalPlan] with PredicateHelper {
+  private def distinct[A](seq: Seq[A]): Seq[A] = {
+    val b = Seq.newBuilder[A]
+    val seen = mutable.HashSet[A]()
+    for (x <- seq) {
+      if (!seen(x)) {
+        b += x
+        seen += x
+      }
+    }
+    b.result()
+  }
+
+  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+    // push the where condition down into join filter
+    case f @ Filter(filterCondition, child) =>
+      val predicates = splitConjunctivePredicates(filterCondition)
+
+      val equalities: Map[AttributeReference, Seq[AttributeReference]] = predicates.flatMap {
+        case EqualTo(l: AttributeReference, r: AttributeReference) =>
+          Seq(l -> r, r -> l)
+        case _ =>
+          Seq.empty
+      } groupBy(_._1) mapValues(eqs => distinct(eqs.map(_._2)))
+
+      val attributeSet = AttributeSet(equalities.keys)
+
+      val additionalFilters = predicates.flatMap { case expr =>
+        val matchingAttributes = expr.references.intersect(attributeSet)
+
+        equalities.filterKeys(matchingAttributes.contains) flatMap { case (l, rs) =>
+          rs flatMap { r =>
+            val rewritten = expr.mapChildren {
+              case a: AttributeReference if a == l => r
+              case e => e
+            }
+            Some(rewritten).filterNot(_ == expr)
+          }
+        }
+      } filterNot {
+        case EqualTo(a, b) if a.semanticEquals(b) => true
+        case EqualNullSafe(a, b) if a.semanticEquals(b) => true
+        case e if predicates.contains(e) => true
+        case _ => false
+      }
+
+      val finalFilters = distinct(predicates ++ additionalFilters)
+
+      Filter(finalFilters reduceLeft And, child)
   }
 }
 

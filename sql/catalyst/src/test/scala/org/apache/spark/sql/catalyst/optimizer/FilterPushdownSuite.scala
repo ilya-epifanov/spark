@@ -36,6 +36,7 @@ class FilterPushdownSuite extends PlanTest {
       Batch("Filter Pushdown", Once,
         SamplePushDown,
         CombineFilters,
+        TransitiveFilterExpansionViaEquality,
         PushPredicateThroughProject,
         BooleanSimplification,
         PushPredicateThroughJoin,
@@ -180,6 +181,20 @@ class FilterPushdownSuite extends PlanTest {
       testRelation
         .where('a === 1 && 'a === 2)
         .select('a).analyze
+
+    comparePlans(optimized, correctAnswer)
+  }
+
+  test("filters: transitive application via equality") {
+    val originalQuery = testRelation
+      .select('a, 'b)
+      .where('a === 1 && 'a === 'b)
+
+    val optimized = Optimize.execute(originalQuery.analyze)
+    val correctAnswer =
+      testRelation
+        .where('a === 1 && 'a === 'b && 'b === 1)
+        .select('a, 'b).analyze
 
     comparePlans(optimized, correctAnswer)
   }
@@ -516,12 +531,12 @@ class FilterPushdownSuite extends PlanTest {
 
     val optimized = Optimize.execute(originalQuery.analyze)
     val lleft = testRelation.where('a >= 3).subquery('z)
-    val left = testRelation.where('a === 1).subquery('x)
+    val left = testRelation.where('a === 1 && 'b >= 3).subquery('x)
     val right = testRelation.subquery('y)
     val correctAnswer =
       lleft.join(
         left.join(right, condition = Some("x.b".attr === "y.b".attr)),
-          condition = Some("z.a".attr === "x.b".attr))
+          condition = Some("z.a".attr === "x.b".attr && "z.a".attr === "y.b".attr))
         .analyze
 
     comparePlans(optimized, analysis.EliminateSubQueries(correctAnswer))
